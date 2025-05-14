@@ -1,0 +1,39 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+  namespace 'com.dp.logcatapp.searchlogs'
+  compileSdk {
+    version = release(36)
+  }
+
+  defaultConfig {
+    minSdkVersion 23
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+  kotlin {
+    compilerOptions {
+      jvmTarget = JvmTarget.JVM_17
+    }
+  }
+  testOptions {
+    unitTests.includeAndroidResources = true
+  }
+}
+
+dependencies {
+  implementation project(":logcat")
+  implementation project(":util")
+  implementation libs.core.ktx
+  implementation libs.appcompat
+  implementation libs.material
+  testImplementation libs.junit
+  testImplementation libs.kotlinx.coroutines.test
+  testImplementation libs.robolectric
+}

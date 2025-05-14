@@ -1,0 +1,32 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+  defaultConfig {
+    compileSdk = 36
+    minSdkVersion 23
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+  kotlin {
+    compilerOptions {
+      jvmTarget = JvmTarget.JVM_17
+    }
+  }
+
+  namespace = 'com.dp.logger'
+}
+
+dependencies {
+  implementation fileTree(dir: 'libs', include: ['*.jar'])
+  implementation libs.kotlin.reflect
+
+  testImplementation libs.junit
+  androidTestImplementation libs.runner
+  androidTestImplementation libs.espresso.core
+}
