@@ -1,0 +1,272 @@
+package com.dp.logcatapp.services
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.PendingIntent.FLAG_IMMUTABLE
+import android.app.PendingIntent.FLAG_UPDATE_CURRENT
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.graphics.BitmapFactory
+import android.os.Build
+import androidx.annotation.RequiresApi
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.edit
+import androidx.lifecycle.lifecycleScope
+import com.dp.logcat.LogcatSession
+import com.dp.logcat.LogcatUtil
+import com.dp.logcatapp.R
+import com.dp.logcatapp.ui.MainActivity
+import com.dp.logcatapp.util.SettingsPrefKeys
+import com.dp.logcatapp.util.getDefaultSharedPreferences
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.getAndUpdate
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.Locale
+
+class LogcatService : BaseService() {
+
+  sealed interface LogcatSessionStatus {
+    data class Started(val session: LogcatSession) : LogcatSessionStatus
+    data object FailedToStart : LogcatSessionStatus
+
+    val sessionOrNull: LogcatSession?
+      get() = (this as? Started)?.session
+  }
+
+  private val _logcatSession = MutableStateFlow<LogcatSessionStatus?>(null)
+  val logcatSessionStatus = _logcatSession.asStateFlow()
+
+  private val restartTrigger = Channel<Unit>(capacity = 1, onBufferOverflow = DROP_OLDEST)
+
+  override fun onCreate() {
+    super.onCreate()
+    if (Build.VERSION.SDK_INT >= 26) {
+      createNotificationChannel()
+    }
+
+    lifecycleScope.launch {
+      startNewLogcatSession()
+      restartTrigger.consumeEach {
+        val current = _logcatSession.getAndUpdate { null }
+        current?.sessionOrNull?.let { session ->
+          withContext(Dispatchers.Default) { session.stop() }
+        }
+        startNewLogcatSession()
+      }
+    }
+  }
+
+  fun restartLogcatSession() {
+    restartTrigger.trySend(Unit)
+  }
+
+  private suspend fun startNewLogcatSession() {
+    val logcatSession = newLogcatSession()
+    if (logcatSession.start()) {
+      _logcatSession.value = LogcatSessionStatus.Started(logcatSession)
+    } else {
+      _logcatSession.value = LogcatSessionStatus.FailedToStart
+    }
+  }
+
+  override fun onPreRegisterSharedPreferenceChangeListener() {
+    val defaultBuffers = SettingsPrefKeys.Logcat.Default.BUFFERS
+    if (defaultBuffers.isNotEmpty() && LogcatUtil.AVAILABLE_BUFFERS.isNotEmpty()) {
+      val buffers = getDefaultSharedPreferences()
+        .getStringSet(SettingsPrefKeys.Logcat.KEY_BUFFERS, emptySet())
+      if (buffers.isNullOrEmpty()) {
+        getDefaultSharedPreferences().edit {
+          putStringSet(SettingsPrefKeys.Logcat.KEY_BUFFERS, defaultBuffers)
+        }
+      }
+    }
+  }
+
+  override fun onStartCommand(
+    intent: Intent?,
+    flags: Int,
+    startId: Int
+  ): Int {
+    super.onStartCommand(intent, flags, startId)
+    startForeground(
+      NOTIFICATION_ID,
+      createNotification(_logcatSession.value?.sessionOrNull?.isRecording == true)
+    )
+    return START_STICKY
+  }
+
+  fun updateNotification(showStopRecording: Boolean) {
+    val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+    nm.notify(NOTIFICATION_ID, createNotification(showStopRecording))
+  }
+
+  private fun createNotification(addStopRecordingAction: Boolean): Notification {
+    val startIntent = Intent(this, MainActivity::class.java)
+    startIntent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+    val contentIntent = PendingIntent.getActivity(
+      this, 0, startIntent,
+      FLAG_UPDATE_CURRENT or FLAG_IMMUTABLE,
+    )
+
+    val exitIntent = Intent(this, MainActivity::class.java)
+    exitIntent.putExtra(MainActivity.EXIT_EXTRA, true)
+    exitIntent.action = "exit"
+    val exitPendingIntent = PendingIntent.getActivity(
+      this, 1, exitIntent,
+      FLAG_UPDATE_CURRENT or FLAG_IMMUTABLE
+    )
+
+    val builder = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL)
+      .setSmallIcon(R.drawable.ic_perm_device_information_white_24dp)
+      .setColor(ContextCompat.getColor(applicationContext, R.color.color_primary))
+      .setContentTitle(getString(R.string.app_name))
+      .setTicker(getString(R.string.app_name))
+      .setContentText(getString(R.string.logcat_service))
+      .setWhen(System.currentTimeMillis())
+      .setContentIntent(contentIntent)
+      .setPriority(NotificationCompat.PRIORITY_HIGH)
+      .setCategory(NotificationCompat.CATEGORY_SERVICE)
+      .setAutoCancel(false)
+
+    if (addStopRecordingAction) {
+      val stopRecordingIntent = Intent(this, MainActivity::class.java)
+      stopRecordingIntent.putExtra(MainActivity.STOP_RECORDING_EXTRA, true)
+      stopRecordingIntent.action = "stop recording"
+      val stopRecordingPendingIntent = PendingIntent.getActivity(
+        this, 2,
+        stopRecordingIntent,
+        FLAG_UPDATE_CURRENT or FLAG_IMMUTABLE
+      )
+      val stopRecordingAction = NotificationCompat.Action.Builder(
+        R.drawable.ic_stop_white_24dp,
+        getString(R.string.stop_recording), stopRecordingPendingIntent
+      )
+        .build()
+
+      builder.addAction(stopRecordingAction)
+    } else {
+      val exitAction = NotificationCompat.Action.Builder(
+        R.drawable.ic_clear_white_24dp,
+        getString(R.string.exit), exitPendingIntent
+      )
+        .build()
+      builder.addAction(exitAction)
+    }
+
+    builder.setLargeIcon(BitmapFactory.decodeResource(resources, R.mipmap.ic_launcher))
+
+    return builder.build()
+  }
+
+  @RequiresApi(26)
+  private fun createNotificationChannel() {
+    val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+    val nc = NotificationChannel(
+      NOTIFICATION_CHANNEL,
+      getString(R.string.logcat_service_channel_name), NotificationManager.IMPORTANCE_LOW
+    )
+    nc.enableLights(false)
+    nc.enableVibration(false)
+    nm.createNotificationChannel(nc)
+  }
+
+  @RequiresApi(26)
+  private fun deleteNotificationChannel() {
+    val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+    nm.deleteNotificationChannel(NOTIFICATION_CHANNEL)
+  }
+
+  override fun onDestroy() {
+    super.onDestroy()
+    _logcatSession.update { status ->
+      status?.sessionOrNull?.stop()
+      null
+    }
+
+    if (Build.VERSION.SDK_INT >= 26) {
+      deleteNotificationChannel()
+    }
+  }
+
+  override fun onSharedPreferenceChanged(
+    sharedPreferences: SharedPreferences,
+    key: String?
+  ) {
+    super.onSharedPreferenceChanged(sharedPreferences, key)
+    when (key) {
+      SettingsPrefKeys.Logcat.KEY_POLL_INTERVAL -> {
+        val pollInterval = sharedPreferences.getInt(
+          key,
+          SettingsPrefKeys.Logcat.Default.POLL_INTERVAL
+        )
+        _logcatSession.value?.sessionOrNull?.apply { pollIntervalMs = pollInterval.toLong() }
+      }
+      SettingsPrefKeys.Logcat.KEY_BUFFERS,
+      SettingsPrefKeys.Logcat.KEY_MAX_LOGS -> {
+        restartTrigger.trySend(Unit)
+      }
+    }
+  }
+
+  private fun newLogcatSession(): LogcatSession {
+    val sharedPreferences = getDefaultSharedPreferences()
+    val bufferValues = sharedPreferences.getStringSet(
+      SettingsPrefKeys.Logcat.KEY_BUFFERS,
+      SettingsPrefKeys.Logcat.Default.BUFFERS
+    )!!
+    val pollInterval = sharedPreferences.getInt(
+      SettingsPrefKeys.Logcat.KEY_POLL_INTERVAL,
+      SettingsPrefKeys.Logcat.Default.POLL_INTERVAL
+    )
+    val maxLogs = sharedPreferences.getInt(
+      SettingsPrefKeys.Logcat.KEY_MAX_LOGS,
+      SettingsPrefKeys.Logcat.Default.MAX_LOGS
+    )
+
+    val buffers = LogcatUtil.AVAILABLE_BUFFERS
+    val logcatBuffers = bufferValues.mapNotNull { e ->
+      buffers.getOrNull(e.toInt())
+        ?.lowercase(Locale.getDefault())
+    }.toSet().ifEmpty {
+      sharedPreferences.edit {
+        putStringSet(
+          SettingsPrefKeys.Logcat.KEY_BUFFERS,
+          SettingsPrefKeys.Logcat.Default.BUFFERS
+        )
+      }
+      LogcatUtil.DEFAULT_BUFFERS
+    }
+
+    return LogcatSession(
+      capacity = maxLogs,
+      buffers = logcatBuffers,
+      pollIntervalMs = pollInterval.toLong()
+    )
+  }
+
+  companion object {
+    private const val NOTIFICATION_CHANNEL = "logcat_channel_01"
+    private const val NOTIFICATION_ID = 1
+
+    fun start(context: Context) {
+      val intent = Intent(context, LogcatService::class.java)
+      ContextCompat.startForegroundService(context, intent)
+    }
+
+    fun stop(context: Context) {
+      val intent = Intent(context, LogcatService::class.java)
+      context.stopService(intent)
+    }
+  }
+}
