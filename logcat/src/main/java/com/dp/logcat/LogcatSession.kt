@@ -1,0 +1,453 @@
+package com.dp.logcat
+
+import android.net.Uri
+import android.os.Build
+import com.dp.logcat.collections.FixedCircularBuffer
+import com.dp.logcatapp.util.DefaultProcessStarter
+import com.dp.logcatapp.util.ProcessStarter
+import com.dp.logger.Logger
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.BufferedReader
+import java.io.BufferedWriter
+import java.io.IOException
+import java.io.InputStreamReader
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
+import kotlin.coroutines.resume
+import kotlin.time.Duration.Companion.seconds
+
+private const val THREAD_JOIN_TIMEOUT = 5_000L // 5 seconds
+
+class LogcatSession(
+  capacity: Int,
+  private val buffers: Set<String>,
+  @Volatile
+  var pollIntervalMs: Long = 250,
+  private val processStarter: ProcessStarter = DefaultProcessStarter(),
+) {
+
+  @Volatile private var record = false
+  private var recordThread: Thread? = null
+
+  private val lock = ReentrantLock() // locks {
+  private val recordBuffer = LinkedBlockingQueue<List<Log>>()
+  private var recordingFileInfo: RecordingFileInfo? = null
+  private val allLogs = FixedCircularBuffer<Log>(
+    capacity = capacity,
+    initialSize = 10_000,
+  )
+  private var onNewLog: ((List<Log>) -> Unit)? = null
+  private val filters = mutableListOf<Filter>()
+  private val exclusions = mutableListOf<Filter>()
+  // }
+
+  private val pendingLogsLock = Any() // locks {
+  private val pendingLogs = FixedCircularBuffer<Log>(
+    capacity = capacity,
+    initialSize = 1000,
+  )
+  // }
+
+  @Volatile private var active = false
+  @Volatile private var paused = false
+  private var stopped = false
+
+  @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+  private val pauseWaiter = Object()
+
+  val isActive: Boolean
+    get() = active
+
+  var isPaused: Boolean
+    get() = paused
+    set(value) {
+      synchronized(pauseWaiter) {
+        paused = value
+        if (!paused) {
+          pauseWaiter.notify()
+        }
+      }
+    }
+
+  private var logcatProcess: Process? = null
+  private var logcatThread: Thread? = null
+  private var pollerThread: Thread? = null
+
+  val isRecording: Boolean get() = lock.withLock { record }
+
+  val logs: Flow<List<Log>> = channelFlow {
+    withContext(Dispatchers.Default) {
+      lock.withLock {
+        trySend(allLogs.filtered())
+        onNewLog = ::trySend
+      }
+    }
+    awaitClose {
+      lock.withLock {
+        onNewLog = null
+      }
+    }
+  }.buffer(capacity, onBufferOverflow = DROP_OLDEST)
+
+  suspend fun start(): Boolean {
+    val started = suspendCancellableCoroutine { cont ->
+      Logger.debug(LogcatSession::class, "starting")
+      check(!stopped) { "LogcatSession was stopped, it cannot be re-started" }
+      check(!active) { "LogcatSession is already active!" }
+      active = true
+      logcatThread = thread(name = "logcat-process-starter") {
+        // calling runBlocking is fine here since this function runs a separate non-ui thread, and not
+        // in a coroutine.
+        val capabilities = runBlocking { logcatCapabilities() }
+        val process = startLogcatProcess(
+          uidSupported = capabilities.uidSupported,
+          yearSupported = capabilities.yearSupported,
+        )
+        cont.resume(process != null)
+        if (process != null) {
+          readLogs(process)
+        }
+        Logger.debug(LogcatSession::class, "stopped logcat thread")
+      }
+      cont.invokeOnCancellation {
+        stop()
+      }
+    }
+    if (started) {
+      pollerThread = thread(name = "logcat-poller") {
+        poll()
+        Logger.debug(LogcatSession::class, "stopped polling thread")
+      }
+    }
+    return started
+  }
+
+  private fun Iterable<Log>.filtered(): List<Log> {
+    return filter { e ->
+      !exclusions.any { it.apply(e) }
+    }.filter { e ->
+      filters.isEmpty() || filters.any { it.apply(e) }
+    }
+  }
+
+  private fun startLogcatProcess(
+    uidSupported: Boolean,
+    yearSupported: Boolean,
+  ): Process? {
+    val cmd = buildList {
+      addAll(listOf("logcat", "-v", "long"))
+      if (uidSupported) {
+        addAll(listOf("-v", "uid"))
+      }
+      if (yearSupported) {
+        addAll(listOf("-v", "year"))
+      }
+      for (buffer in buffers) {
+        add("-b")
+        add(buffer)
+      }
+    }
+    return try {
+      processStarter.start(cmd).also { process ->
+        logcatProcess = process
+      }
+    } catch (_: IOException) {
+      Logger.debug(LogcatSession::class, "error starting logcat process")
+      null
+    }
+  }
+
+  private fun readLogs(process: Process) {
+    try {
+      val inputStream = process.inputStream
+      val errorStream = process.errorStream
+      val stdoutReaderThread = thread(name = "logcat-stdout-reader") {
+        try {
+          runBlocking {
+            try {
+              LogcatStreamReader(inputStream).use { reader ->
+                val initialLogs = mutableListOf<Log>()
+                // Collect initial logs for about a second in order to not peg consumer.
+                withTimeoutOrNull(1.seconds) {
+                  while (reader.hasNext()) {
+                    initialLogs += reader.next()
+                    ensureActive()
+                  }
+                }
+
+                synchronized(pendingLogsLock) {
+                  pendingLogs += initialLogs
+                }
+
+                reader.forEach { log ->
+                  synchronized(pendingLogsLock) {
+                    pendingLogs += log
+                  }
+                }
+              }
+            } catch (_: Exception) {
+              // Do nothing.
+            }
+          }
+        } catch (_: InterruptedException) {
+          // Do nothing.
+        }
+        Logger.debug(LogcatSession::class, "stopped logcat reader thread")
+      }
+      val stderrReaderThread = thread(name = "logcat-stderr-reader") {
+        try {
+          BufferedReader(InputStreamReader(errorStream)).use {
+            val buffer = CharArray(8192)
+            while (it.read(buffer) != -1) {
+              // Just consume it, do nothing.
+            }
+          }
+        } catch (_: Exception) {
+        }
+      }
+
+      // We don't care about the exit value as the process doesn't exit normally.
+      process.waitFor()
+      inputStream.close()
+      errorStream.close()
+      stdoutReaderThread.join(THREAD_JOIN_TIMEOUT)
+      stderrReaderThread.join(THREAD_JOIN_TIMEOUT)
+    } catch (_: Exception) {
+      Logger.debug(LogcatSession::class, "error reading logs")
+    }
+  }
+
+  private fun poll() {
+    while (active) {
+      synchronized(pauseWaiter) {
+        while (paused) {
+          try {
+            pauseWaiter.wait()
+          } catch (_: InterruptedException) {
+          }
+        }
+      }
+
+      pollOnce()
+
+      try {
+        Thread.sleep(pollIntervalMs)
+      } catch (_: InterruptedException) {
+        // Do nothing
+      }
+    }
+  }
+
+  private fun pollOnce() {
+    lock.withLock {
+      val filtered = synchronized(pendingLogsLock) {
+        allLogs += pendingLogs
+        val filtered = pendingLogs.filtered()
+        pendingLogs.clear()
+        filtered
+      }
+
+      // If recording is enabled, then add to record buffer.
+      if (record) {
+        recordBuffer += filtered
+      }
+
+      if (filtered.isNotEmpty()) {
+        onNewLog?.invoke(filtered)
+      }
+    }
+  }
+
+  fun stop() {
+    Logger.debug(LogcatSession::class, "stopping")
+    stopped = true
+    active = false
+    record = false
+    isPaused = false
+    if (Build.VERSION.SDK_INT >= 26) {
+      logcatProcess?.destroyForcibly()
+    } else {
+      logcatProcess?.destroy()
+    }
+    logcatProcess = null
+    logcatThread?.join(THREAD_JOIN_TIMEOUT)
+    logcatThread = null
+
+    pollerThread?.let { thread ->
+      thread.interrupt()
+      thread.join(THREAD_JOIN_TIMEOUT)
+    }
+    pollerThread = null
+
+    recordThread?.let { thread ->
+      thread.interrupt()
+      thread.join(THREAD_JOIN_TIMEOUT)
+    }
+    recordThread = null
+
+    lock.withLock {
+      allLogs.clear()
+      synchronized(pendingLogsLock) {
+        pendingLogs.clear()
+      }
+      recordBuffer.clear()
+      recordingFileInfo = null
+    }
+    Logger.debug(LogcatSession::class, "stopped")
+  }
+
+  fun startRecording(
+    recordingFileInfo: RecordingFileInfo,
+    writer: BufferedWriter,
+  ) {
+    if (record) {
+      return
+    }
+
+    lock.withLock {
+      this.recordingFileInfo = recordingFileInfo
+      record = true
+      recordThread = thread(name = "logcat-recorder") {
+        while (record) {
+          val logs = try {
+            recordBuffer.take()
+          } catch (_: InterruptedException) {
+            break
+          }
+
+          try {
+            logs.forEach { log ->
+              writer.write(log.toString())
+            }
+            writer.flush()
+          } catch (_: Exception) {
+            break
+          }
+        }
+
+        try {
+          writer.flush()
+          writer.close()
+        } catch (_: Exception) {
+        }
+      }
+    }
+  }
+
+  fun stopRecording(): RecordingFileInfo? {
+    return lock.withLock {
+      record = false
+      recordThread?.let { thread ->
+        thread.interrupt()
+        thread.join(THREAD_JOIN_TIMEOUT)
+      }
+      recordThread = null
+      recordBuffer.clear()
+      val result = recordingFileInfo
+      recordingFileInfo = null
+      result
+    }
+  }
+
+  fun setFilters(filters: List<Filter>, exclusion: Boolean = false) {
+    lock.withLock {
+      if (exclusion) {
+        exclusions.clear()
+        exclusions += filters
+      } else {
+        this.filters.clear()
+        this.filters += filters
+      }
+    }
+  }
+
+  fun clearLogs() {
+    lock.withLock {
+      allLogs.clear()
+      synchronized(pendingLogsLock) {
+        pendingLogs.clear()
+      }
+    }
+  }
+
+  data class RecordingFileInfo(
+    val fileName: String,
+    val uri: Uri,
+    val isCustomLocation: Boolean,
+  )
+
+  companion object {
+
+    data class LogcatCapabilities(
+      val uidSupported: Boolean,
+      val yearSupported: Boolean,
+    )
+
+    private val LogcatCapabilitiesPlaceholder =
+      LogcatCapabilities(uidSupported = false, yearSupported = false)
+
+    private val _capabilities = MutableStateFlow<LogcatCapabilities>(LogcatCapabilitiesPlaceholder)
+    val capabilities = _capabilities.asStateFlow()
+
+    init {
+      // This is ok since we are simply executing a `logcat` process and getting the result from
+      // it without accessing any Android APIs.
+      @OptIn(DelicateCoroutinesApi::class)
+      GlobalScope.launch {
+        Logger.debug(LogcatSession::class, "initialize logcat capabilities")
+        _capabilities.value = getLogcatCapabilities().also {
+          Logger.debug(LogcatSession::class, "logcat capabilities: $it")
+        }
+      }
+    }
+
+    private suspend fun getLogcatCapabilities() = coroutineScope {
+      // Try to dump logcat logs on separate threads.
+      val uidSupportedDeferred = async(Dispatchers.IO) { dumpLogcatLogWithOptions("-v", "uid") }
+      val yearSupportedDeferred = async(Dispatchers.IO) { dumpLogcatLogWithOptions("-v", "year") }
+      val (uidSupported, yearSupported) = awaitAll(uidSupportedDeferred, yearSupportedDeferred)
+      LogcatCapabilities(
+        uidSupported = uidSupported,
+        yearSupported = yearSupported,
+      )
+    }
+
+    suspend fun logcatCapabilities(): LogcatCapabilities {
+      return capabilities.filter { it !== LogcatCapabilitiesPlaceholder }.first()
+    }
+
+    private fun dumpLogcatLogWithOptions(
+      vararg options: String
+    ): Boolean {
+      check(options.isNotEmpty())
+      // Using brief outputs less lines, which improves the speed of consumption. Nevertheless,
+      // it will still exit with non-zero value if the given options are not valid.
+      return CommandUtils.runCmd(
+        cmd = listOf("logcat", "-v", "brief", *options, "-d"),
+        redirectStderr = true,
+      ) == 0
+    }
+  }
+}
