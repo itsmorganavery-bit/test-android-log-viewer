@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<resources>
+
+  <style name="LightThemeCommon" parent="Theme.AppCompat.Light.NoActionBar">
+    <item name="preferenceTheme">@style/MyPreferenceTheme</item>
+    <item name="android:textViewStyle">@style/LightTextViewStyle</item>
+  </style>
+
+  <style name="DarkThemeCommon" parent="Theme.AppCompat.NoActionBar">
+    <item name="preferenceTheme">@style/MyPreferenceTheme</item>
+
+    <item name="android:textViewStyle">@style/DarkTextViewStyle</item>
+  </style>
+
+  <style name="BlackThemeCommon" parent="DarkThemeCommon" />
+
+  <style name="LightTheme" parent="LightThemeCommon" />
+
+  <style name="DarkTheme" parent="DarkThemeCommon" />
+
+  <style name="BlackTheme" parent="BlackThemeCommon" />
+
+  <style name="LightTextViewStyle" parent="android:Widget.TextView">
+    <item name="android:textColorHint">#61000000</item>
+  </style>
+
+  <style name="DarkTextViewStyle" parent="android:Widget.TextView">
+    <item name="android:textColorHint">#80ffffff</item>
+  </style>
+
+  <style name="ToolBarTheme" parent="ThemeOverlay.AppCompat.Dark.ActionBar" />
+
+  <style name="DarkToolbarPopupTheme" parent="ThemeOverlay.AppCompat.Dark" />
+
+  <style name="LightToolbarPopupTheme" parent="ThemeOverlay.AppCompat.Light" />
+
+  <style name="MyPreferenceTheme" parent="@style/PreferenceThemeOverlay.v14.Material" />
+
+  <style name="SplashScreenThemeCommon" parent="Theme.SplashScreen">
+    <item name="windowSplashScreenBackground">@color/color_primary</item>
+    <item name="windowSplashScreenAnimatedIcon">@drawable/splash_screen</item>
+    <item name="postSplashScreenTheme">@style/LightTheme</item>
+  </style>
+
+  <style name="SplashScreenTheme" parent="SplashScreenThemeCommon" />
+
+</resources>
