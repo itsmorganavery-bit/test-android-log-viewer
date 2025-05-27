@@ -1,0 +1,56 @@
+package com.dp.logcat
+
+import com.dp.logcatapp.util.closeQuietly
+import java.io.BufferedReader
+import java.io.Closeable
+import java.io.InputStream
+import java.io.InputStreamReader
+
+class LogcatStreamReader(inputStream: InputStream) : Iterator<Log>, Closeable {
+  private val reader: BufferedReader = BufferedReader(InputStreamReader(inputStream))
+  private val msgBuffer = StringBuilder()
+  private var log: Log? = null
+  private var id = 0
+
+  override fun hasNext(): Boolean {
+    // Prevent reading and parsing the subsequent logs if we've already parsed one but have not
+    // consumed it.
+    if (log != null) return true
+    var metadata = reader.readLine()?.trim() ?: return false
+    while (!metadata.startsWith("[")) {
+      metadata = reader.readLine()?.trim() ?: return false
+    }
+
+    var msg = reader.readLine() ?: return false
+    msgBuffer.append(msg)
+
+    msg = reader.readLine() ?: return false
+    while (msg.isNotEmpty()) {
+      msgBuffer.append("\n")
+        .append(msg)
+
+      msg = reader.readLine() ?: return false
+    }
+
+    return try {
+      log = Log.parse(id = id, metadata = metadata, msg = msgBuffer.toString())
+      id += 1
+      true
+    } catch (_: Exception) {
+      // Logger.debug(Logcat::class, "${e.message}: $metadata")
+      false
+    } finally {
+      msgBuffer.setLength(0)
+    }
+  }
+
+  override fun next(): Log {
+    val result = log ?: throw NoSuchElementException("did you forget to call hasNext() first?")
+    log = null
+    return result
+  }
+
+  override fun close() {
+    reader.closeQuietly()
+  }
+}
